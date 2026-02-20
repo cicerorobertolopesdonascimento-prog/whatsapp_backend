@@ -1,45 +1,47 @@
-require('dotenv').config();
-const express = require('express');
-const nodemailer = require('nodemailer');
-
-const app = express();
-app.use(express.json());
-
-const PORT = process.env.PORT || 3000;
-
-// Configuração do Gmail
+// Configuração do Gmail com timeouts
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
     user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
-  }
+    pass: process.env.EMAIL_PASS,
+  },
+  connectionTimeout: 10000,
+  greetingTimeout: 10000,
+  socketTimeout: 10000,
 });
 
-// Rota teste
-app.get('/', (req, res) => {
-  res.send('Servidor de email funcionando 🚀');
-});
-
-// Enviar email
 app.post('/send-email', async (req, res) => {
   try {
-    const { to, subject, message } = req.body;
+    const { to, subject, message } = req.body || {};
 
-    await transporter.sendMail({
+    // validações
+    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+      return res.status(500).json({
+        error: 'Servidor sem EMAIL_USER/EMAIL_PASS no Render (Environment).',
+      });
+    }
+    if (!to || !subject || !message) {
+      return res.status(400).json({
+        error: 'Campos obrigatórios: to, subject, message',
+      });
+    }
+
+    const info = await transporter.sendMail({
       from: process.env.EMAIL_USER,
-      to: to,
-      subject: subject,
-      text: message
+      to,
+      subject,
+      text: message,
     });
 
-    res.json({ success: true });
+    return res.json({ success: true, messageId: info.messageId || null });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Erro ao enviar email' });
+    console.error('Erro nodemailer:', error);
+    // devolve o erro real (ajuda MUITO)
+    return res.status(500).json({
+      success: false,
+      error: error?.message || String(error),
+      code: error?.code || null,
+      response: error?.response || null,
+    });
   }
-});
-
-app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
 });
