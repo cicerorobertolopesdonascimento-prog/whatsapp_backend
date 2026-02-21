@@ -1,26 +1,44 @@
-require('dotenv').config();
+/**
+ * server.js — ROTAS Email API (Resend) — pronto para Render
+ *
+ * ✅ Render: use ENV vars no painel (não dependa de .env)
+ * ✅ Local: usa .env automaticamente (NODE_ENV !== 'production')
+ */
+
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config();
+}
+
 const express = require('express');
+// const cors = require('cors'); // se precisar liberar chamadas do app/web
 const { Resend } = require('resend');
 
 const app = express();
 
-// JSON com limite maior (caso você mande HTML grande ou payload maior no futuro)
+// Se seu payload pode conter HTML grande
 app.use(express.json({ limit: '2mb' }));
 
+// Se precisar CORS (ex: front web chamando essa API)
+// app.use(cors({ origin: true }));
+
+// Render exige PORT via env
 const PORT = process.env.PORT || 3000;
 
-// Resend client (reutiliza)
+// ===== ENV / Branding =====
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
-// Pode ser apenas um email (ex: onboarding@resend.dev) OU "Nome <email>".
 const RESEND_FROM = process.env.RESEND_FROM || 'onboarding@resend.dev';
-// Se RESEND_FROM for apenas email, este nome será usado no "display name".
 const RESEND_FROM_NAME = process.env.RESEND_FROM_NAME || 'Cicero Nascimento - ROTAS';
 
-// Branding padrão (pode sobrescrever via payload.emailBranding)
 const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#111111';
 const BRAND_SECONDARY = process.env.BRAND_SECONDARY || '#F2C200';
 const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || '';
 
+const REPORTS_TO_EMAIL = process.env.REPORTS_TO_EMAIL || ''; // opcional
+
+// Reusa o client
+const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
+
+// ===== Helpers =====
 function asArray(value) {
   if (!value) return [];
   if (Array.isArray(value)) return value.filter(Boolean);
@@ -55,7 +73,6 @@ function renderReportEmailHtml(payload) {
   const generatedAt = payload?.generatedAt || '';
   const pdfUrl = payload?.export?.pdfUrl || payload?.pdfUrl || '';
 
-  // Resumo (lista)
   const summaryLines = [];
   if (payload?.route?.routeName) summaryLines.push(`Rota: ${payload.route.routeName}`);
   if (payload?.route?.unit) summaryLines.push(`Unidade: ${payload.route.unit}`);
@@ -93,7 +110,7 @@ function renderReportEmailHtml(payload) {
                (o) => `<li style="margin:6px 0;">
                  <b>${escapeHtml(o.title || 'Ocorrência')}</b>
                  ${o.details ? `<div style="color:#555;">${escapeHtml(o.details)}</div>` : ''}
-               </li>`,
+               </li>`
              )
              .join('')}
          </ol>
@@ -165,23 +182,33 @@ function renderReportEmailText(payload) {
   return lines.join('\n');
 }
 
+function normalizeNfc(v) {
+  if (v === undefined || v === null) return v;
+  return String(v).normalize('NFC');
+}
+
+function ensureResendReady(res) {
+  if (!RESEND_API_KEY || !resend) {
+    res.status(500).json({ ok: false, error: 'RESEND_API_KEY não configurada.' });
+    return false;
+  }
+  return true;
+}
+
+// ===== Routes =====
 app.get('/', (req, res) => {
   res.status(200).send('Servidor de email via API funcionando.');
 });
 
-// health check (bom para ping/keep-alive)
 app.get('/health', (req, res) => {
   res.status(200).json({ ok: true });
 });
 
 app.post('/send-email', async (req, res) => {
   try {
-    if (!RESEND_API_KEY) {
-      return res.status(500).json({ ok: false, error: 'RESEND_API_KEY não configurada.' });
-    }
+    if (!ensureResendReady(res)) return;
 
     const { to, subject, message, html } = req.body || {};
-
     const recipients = asArray(to);
 
     if (!recipients.length) {
@@ -190,23 +217,18 @@ app.post('/send-email', async (req, res) => {
     if (!subject || String(subject).trim().length === 0) {
       return res.status(400).json({ ok: false, error: 'Campo obrigatório: subject.' });
     }
-    if ((!message || String(message).trim().length === 0) && (!html || String(html).trim().length === 0)) {
+    const hasText = message && String(message).trim().length > 0;
+    const hasHtml = html && String(html).trim().length > 0;
+    if (!hasText && !hasHtml) {
       return res.status(400).json({ ok: false, error: 'Obrigatório: message (texto) ou html.' });
     }
-
-    const resend = new Resend(RESEND_API_KEY);
-
-    // Normaliza strings (ajuda a evitar caracteres “quebrados”)
-    const safeSubject = String(subject).normalize('NFC');
-    const safeText = message ? String(message).normalize('NFC') : undefined;
-    const safeHtml = html ? String(html).normalize('NFC') : undefined;
 
     const payload = {
       from: buildFromHeader(),
       to: recipients,
-      subject: safeSubject,
-      text: safeText,
-      html: safeHtml,
+      subject: normalizeNfc(subject),
+      text: hasText ? normalizeNfc(message) : undefined,
+      html: hasHtml ? normalizeNfc(html) : undefined,
     };
 
     const response = await resend.emails.send(payload);
@@ -217,52 +239,51 @@ app.post('/send-email', async (req, res) => {
       data: response,
     });
   } catch (error) {
-    // Resend costuma retornar erro estruturado às vezes
     const msg = error?.message || String(error);
     console.error('Erro /send-email:', msg, error);
     return res.status(500).json({ ok: false, error: msg });
   }
 });
 
-// ✅ Endpoint novo: recebe o JSON do relatório (resumo + link do PDF) e envia e-mail com layout
-// O app deve chamar este endpoint quando exportar o PDF manualmente e no fim do turno.
+/**
+ * ✅ Endpoint: recebe JSON do relatório e envia e-mail com layout
+ * Regra: NÃO envia se pdfUrl estiver vazio ou statusUploadPdf != READY
+ */
 app.post('/api/reports/notify', async (req, res) => {
   try {
-    if (!RESEND_API_KEY) {
-      return res.status(500).json({ ok: false, error: 'RESEND_API_KEY não configurada.' });
-    }
+    if (!ensureResendReady(res)) return;
 
     const body = req.body || {};
-
-    // ✅ pega status e pdfUrl do formato certo do seu app
     const statusUploadPdf = body?.export?.statusUploadPdf || body?.statusUploadPdf || '';
     const pdfUrl = body?.export?.pdfUrl || body?.pdfUrl || '';
 
-    // ✅ NÃO envia e-mail se ainda não tem PDF (PENDING)
+    // ✅ NÃO envia e-mail se ainda não tem PDF (READY + URL)
     if (!pdfUrl || String(statusUploadPdf).toUpperCase() !== 'READY') {
       console.log('[REPORT_NOTIFY] skip: status=', statusUploadPdf, 'pdfUrl=', pdfUrl);
       return res.status(200).json({ ok: true, skipped: true, reason: 'PDF not ready' });
     }
 
-    const recipients = asArray(body.to || process.env.REPORTS_TO_EMAIL);
+    const recipients = asArray(body.to || REPORTS_TO_EMAIL);
     if (!recipients.length) {
-      return res.status(400).json({ ok: false, error: 'Informe "to" no body ou defina REPORTS_TO_EMAIL no ambiente.' });
+      return res.status(400).json({
+        ok: false,
+        error: 'Informe "to" no body ou defina REPORTS_TO_EMAIL no ambiente.',
+      });
     }
 
-    // ✅ logs corretos (do seu JSON real)
     console.log('[REPORT_NOTIFY] eventType:', body?.eventType);
     console.log('[REPORT_NOTIFY] exportedBy:', body?.export?.exportedBy?.operatorName);
     console.log('[REPORT_NOTIFY] pdfUrl:', pdfUrl);
 
     const unit = body?.route?.unit || 'Unidade';
     const shift = body?.route?.shift || 'Turno';
-    const subject = body?.subject
-      ? String(body.subject).normalize('NFC')
-      : `Relatório ROTAS • ${String(unit).normalize('NFC')} • ${String(shift).normalize('NFC')}`;
 
-    const resend = new Resend(RESEND_API_KEY);
-    const html = renderReportEmailHtml(body).normalize('NFC');
-    const text = renderReportEmailText(body).normalize('NFC');
+    const subject = body?.subject
+      ? normalizeNfc(body.subject)
+      : `Relatório ROTAS • ${normalizeNfc(unit)} • ${normalizeNfc(shift)}`;
+
+    const html = normalizeNfc(renderReportEmailHtml(body));
+    const text = normalizeNfc(renderReportEmailText(body));
 
     const response = await resend.emails.send({
       from: buildFromHeader(),
@@ -278,4 +299,10 @@ app.post('/api/reports/notify', async (req, res) => {
     console.error('Erro /api/reports/notify:', msg, error);
     return res.status(500).json({ ok: false, error: msg });
   }
+});
+
+// ✅ MUITO IMPORTANTE: manter o processo vivo no Render
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ API listening on ${PORT}`);
+  console.log(`✅ NODE_ENV=${process.env.NODE_ENV || '(not set)'}`);
 });
