@@ -38,6 +38,15 @@ const REPORTS_TO_EMAIL = process.env.REPORTS_TO_EMAIL || ''; // opcional
 // Reusa o client
 const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
+// ===== Report Notify Queue (definitivo) =====
+const REPORT_NOTIFY_RETRY_SECONDS = Number(process.env.REPORT_NOTIFY_RETRY_SECONDS || 30); // 30s
+const REPORT_NOTIFY_MAX_ATTEMPTS = Number(process.env.REPORT_NOTIFY_MAX_ATTEMPTS || 40);  // ~20min
+const REPORT_NOTIFY_DEDUP_TTL_MIN = Number(process.env.REPORT_NOTIFY_DEDUP_TTL_MIN || 180); // 3h
+
+// Memória simples (ok no Render se 1 instancia; se escalar, use Redis/DB)
+const reportQueue = new Map();   // key -> { body, recipients, attempts, nextAt, createdAt }
+const reportSent = new Map();    // key -> sentAt
+
 // ===== Helpers =====
 function asArray(value) {
   if (!value) return [];
@@ -200,6 +209,37 @@ function ensureResendReady(res) {
   return true;
 }
 
+function stableKeyFromReport(body, recipients) {
+  // Preferência: reportId vindo do app
+  const explicit = body?.reportId || body?.export?.reportId || body?.export?.runId || body?.runId;
+  if (explicit) return `rid:${String(explicit)}`;
+
+  // fallback: combina infos comuns
+  const unit = body?.route?.unit || '';
+  const shift = body?.route?.shift || '';
+  const generatedAt = body?.generatedAt || '';
+  const pdfUrl = body?.export?.pdfUrl || body?.pdfUrl || '';
+  const toKey = recipients.join(',');
+
+  return `auto:${unit}|${shift}|${generatedAt}|${pdfUrl}|${toKey}`;
+}
+
+function isPdfReady(body) {
+  const statusUploadPdf = body?.export?.statusUploadPdf || body?.statusUploadPdf || '';
+  const pdfUrl = body?.export?.pdfUrl || body?.pdfUrl || '';
+  const okStatus = String(statusUploadPdf).toUpperCase() === 'READY';
+  const okUrl = typeof pdfUrl === 'string' && pdfUrl.trim().length > 0;
+  return { ready: okStatus && okUrl, statusUploadPdf, pdfUrl };
+}
+
+function cleanupDedup() {
+  const now = Date.now();
+  const ttl = REPORT_NOTIFY_DEDUP_TTL_MIN * 60 * 1000;
+  for (const [k, t] of reportSent.entries()) {
+    if (now - t > ttl) reportSent.delete(k);
+  }
+}
+
 // ===== Routes =====
 app.get('/', (req, res) => {
   res.status(200).send('Servidor de email via API funcionando.');
@@ -209,47 +249,90 @@ app.get('/health', (req, res) => {
   res.status(200).json({ ok: true });
 });
 
-app.post('/send-email', async (req, res) => {
+app.post('/api/reports/notify', async (req, res) => {
   try {
     if (!ensureResendReady(res)) return;
 
-    const { to, subject, message, html } = req.body || {};
-    const recipients = asArray(to);
+    const body = req.body || {};
+    const recipients = asArray(body.to || REPORTS_TO_EMAIL);
 
     if (!recipients.length) {
-      return res.status(400).json({ ok: false, error: 'Campo obrigatório: to (string ou array).' });
-    }
-    if (!subject || String(subject).trim().length === 0) {
-      return res.status(400).json({ ok: false, error: 'Campo obrigatório: subject.' });
-    }
-    const hasText = message && String(message).trim().length > 0;
-    const hasHtml = html && String(html).trim().length > 0;
-    if (!hasText && !hasHtml) {
-      return res.status(400).json({ ok: false, error: 'Obrigatório: message (texto) ou html.' });
+      return res.status(400).json({
+        ok: false,
+        error: 'Informe "to" no body ou defina REPORTS_TO_EMAIL no ambiente.',
+      });
     }
 
-    const payload = {
-      from: buildFromHeader(),
-      to: recipients,
-      subject: normalizeNfc(subject),
-      text: hasText ? normalizeNfc(message) : undefined,
-      html: hasHtml ? normalizeNfc(html) : undefined,
-    };
+    // chave idempotente (evita duplicados)
+    const key = stableKeyFromReport(body, recipients);
 
-    const response = await resend.emails.send(payload);
+    // se já foi enviado, não envia de novo
+    if (reportSent.has(key)) {
+      return res.status(200).json({ ok: true, dedup: true, key });
+    }
 
-    return res.status(200).json({
+    // verifica se está pronto
+    const { ready, statusUploadPdf, pdfUrl } = isPdfReady(body);
+
+    console.log('[REPORT_NOTIFY] key=', key);
+    console.log('[REPORT_NOTIFY] recipients=', recipients);
+    console.log('[REPORT_NOTIFY] statusUploadPdf=', statusUploadPdf, 'pdfUrl=', pdfUrl);
+
+    if (ready) {
+      // envia imediatamente
+      const unit = body?.route?.unit || 'Unidade';
+      const shift = body?.route?.shift || 'Turno';
+
+      const subject = body?.subject
+        ? normalizeNfc(body.subject)
+        : `Relatório ROTAS • ${normalizeNfc(unit)} • ${normalizeNfc(shift)}`;
+
+      const html = normalizeNfc(renderReportEmailHtml(body));
+      const text = normalizeNfc(renderReportEmailText(body));
+
+      const response = await resend.emails.send({
+        from: buildFromHeader(),
+        to: recipients,
+        subject,
+        html,
+        text,
+      });
+
+      reportSent.set(key, Date.now());
+
+      return res.status(200).json({
+        ok: true,
+        sentTo: recipients.length,
+        key,
+        data: response,
+      });
+    }
+
+    // ✅ NÃO pula: enfileira e tenta até ficar READY
+    reportQueue.set(key, {
+      body,
+      recipients,
+      attempts: 0,
+      createdAt: Date.now(),
+      nextAt: Date.now() + 1000, // tenta em 1s
+    });
+
+    return res.status(202).json({
       ok: true,
-      sentTo: recipients.length,
-      data: response,
+      queued: true,
+      key,
+      statusUploadPdf,
+      pdfUrl,
+      recipientsCount: recipients.length,
+      retryEverySeconds: REPORT_NOTIFY_RETRY_SECONDS,
+      maxAttempts: REPORT_NOTIFY_MAX_ATTEMPTS,
     });
   } catch (error) {
     const msg = error?.message || String(error);
-    console.error('Erro /send-email:', msg, error);
+    console.error('Erro /api/reports/notify:', msg, error);
     return res.status(500).json({ ok: false, error: msg });
   }
 });
-
 /**
  * ✅ Endpoint: recebe JSON do relatório e envia e-mail com layout
  * Regra: NÃO envia se pdfUrl estiver vazio ou statusUploadPdf != READY
@@ -319,6 +402,73 @@ app.post('/api/reports/notify', async (req, res) => {
 });
 
 // ✅ MUITO IMPORTANTE: manter o processo vivo no Render
+async function processQueueTick() {
+  try {
+    cleanupDedup();
+    const now = Date.now();
+
+    for (const [key, job] of reportQueue.entries()) {
+      if (job.nextAt > now) continue;
+
+      const { ready, statusUploadPdf, pdfUrl } = isPdfReady(job.body);
+
+      console.log('[QUEUE] key=', key, 'attempt=', job.attempts, 'ready=', ready, 'status=', statusUploadPdf);
+
+      if (!ready) {
+        job.attempts += 1;
+
+        if (job.attempts >= REPORT_NOTIFY_MAX_ATTEMPTS) {
+          console.log('[QUEUE] give up key=', key, 'status=', statusUploadPdf, 'pdfUrl=', pdfUrl);
+          reportQueue.delete(key);
+          continue;
+        }
+
+        job.nextAt = now + REPORT_NOTIFY_RETRY_SECONDS * 1000;
+        continue;
+      }
+
+      // Já enviado? (dedup)
+      if (reportSent.has(key)) {
+        console.log('[QUEUE] already sent key=', key);
+        reportQueue.delete(key);
+        continue;
+      }
+
+      // Envia
+      const body = job.body;
+      const recipients = job.recipients;
+
+      const unit = body?.route?.unit || 'Unidade';
+      const shift = body?.route?.shift || 'Turno';
+
+      const subject = body?.subject
+        ? normalizeNfc(body.subject)
+        : `Relatório ROTAS • ${normalizeNfc(unit)} • ${normalizeNfc(shift)}`;
+
+      const html = normalizeNfc(renderReportEmailHtml(body));
+      const text = normalizeNfc(renderReportEmailText(body));
+
+      const response = await resend.emails.send({
+        from: buildFromHeader(),
+        to: recipients,
+        subject,
+        html,
+        text,
+      });
+
+      reportSent.set(key, Date.now());
+      reportQueue.delete(key);
+
+      console.log('[QUEUE] sent key=', key, 'sentTo=', recipients.length, 'res=', response?.data?.id || 'ok');
+    }
+  } catch (e) {
+    console.error('[QUEUE] tick error:', e?.message || String(e), e);
+  }
+}
+
+// roda a cada 5s
+setInterval(processQueueTick, 5000);
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ API listening on ${PORT}`);
   console.log(`✅ NODE_ENV=${process.env.NODE_ENV || '(not set)'}`);
