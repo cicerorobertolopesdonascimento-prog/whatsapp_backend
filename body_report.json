@@ -1,0 +1,30 @@
+{
+  "to": ["cicerorobertolopesdonascimento@gmail.com"],
+  "eventType": "manual_export",
+  "generatedAt": "2026-02-21T18:05:22-03:00",
+  "route": {
+    "routeName": "Rota X",
+    "unit": "Armazém",
+    "shift": "Turno 1"
+  },
+  "export": {
+    "exportedBy": { "operatorName": "Fulano (crachá 123)" },
+    "pdfUrl": "https://exemplo.com/relatorio.pdf"
+  },
+  "status": {
+    "openPendencies": 2,
+    "closedPendencies": 5
+  },
+  "checklists": { "okPercent": 90 },
+  "topOccurrences": [
+    { "title": "Moega 2 obstruída", "details": "Abertura parcial" },
+    { "title": "Checklist Armazém", "details": "2 itens NOK" },
+    { "title": "Tripper", "details": "Posição 14" }
+  ],
+  "emailBranding": {
+    "senderDisplayName": "Cicero Nascimento - ROTAS",
+    "primaryColorHex": "#111111",
+    "secondaryColorHex": "#F2C200",
+    "logoUrl": "https://SEU_LINK_PUBLICO_PARA_LOGO.png"
+  }
+}
