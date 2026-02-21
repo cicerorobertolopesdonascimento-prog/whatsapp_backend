@@ -232,19 +232,27 @@ app.post('/api/reports/notify', async (req, res) => {
       return res.status(500).json({ ok: false, error: 'RESEND_API_KEY não configurada.' });
     }
 
-    const body = req.body.summary || req.body || {};
-    const recipients = asArray(body.to || process.env.REPORTS_TO_EMAIL);
+    const body = req.body || {};
 
-    if (!recipients.length) {
-      return res
-        .status(400)
-        .json({ ok: false, error: 'Informe "to" no body ou defina REPORTS_TO_EMAIL no ambiente.' });
+    // ✅ pega status e pdfUrl do formato certo do seu app
+    const statusUploadPdf = body?.export?.statusUploadPdf || body?.statusUploadPdf || '';
+    const pdfUrl = body?.export?.pdfUrl || body?.pdfUrl || '';
+
+    // ✅ NÃO envia e-mail se ainda não tem PDF (PENDING)
+    if (!pdfUrl || String(statusUploadPdf).toUpperCase() !== 'READY') {
+      console.log('[REPORT_NOTIFY] skip: status=', statusUploadPdf, 'pdfUrl=', pdfUrl);
+      return res.status(200).json({ ok: true, skipped: true, reason: 'PDF not ready' });
     }
 
-    // Logs mínimos para confirmar que o backend está lendo o resumo
+    const recipients = asArray(body.to || process.env.REPORTS_TO_EMAIL);
+    if (!recipients.length) {
+      return res.status(400).json({ ok: false, error: 'Informe "to" no body ou defina REPORTS_TO_EMAIL no ambiente.' });
+    }
+
+    // ✅ logs corretos (do seu JSON real)
     console.log('[REPORT_NOTIFY] eventType:', body?.eventType);
-    console.log('[REPORT_NOTIFY] exportedBy:', body?.export?.exportedBy?.operatorName || body?.exportedBy);
-    console.log('[REPORT_NOTIFY] pdfUrl:', body?.export?.pdfUrl || body?.pdfUrl);
+    console.log('[REPORT_NOTIFY] exportedBy:', body?.export?.exportedBy?.operatorName);
+    console.log('[REPORT_NOTIFY] pdfUrl:', pdfUrl);
 
     const unit = body?.route?.unit || 'Unidade';
     const shift = body?.route?.shift || 'Turno';
@@ -270,8 +278,4 @@ app.post('/api/reports/notify', async (req, res) => {
     console.error('Erro /api/reports/notify:', msg, error);
     return res.status(500).json({ ok: false, error: msg });
   }
-});
-
-app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
 });
