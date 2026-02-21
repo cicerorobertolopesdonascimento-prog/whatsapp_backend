@@ -42,14 +42,12 @@ const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 function asArray(value) {
   if (!value) return [];
 
-  const list = Array.isArray(value)
-    ? value
-    : String(value).split(/[;,]/g);
+  const list = Array.isArray(value) ? value : String(value).split(/[;,]/g);
 
   return list
-    .map(v => String(v).trim())
-    .filter(v => v.length > 0)
-    .filter(v => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)); // valida email básico
+    .map((v) => String(v).trim())
+    .filter((v) => v.length > 0)
+    .filter((v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)); // valida email básico
 }
 
 function escapeHtml(s) {
@@ -117,7 +115,7 @@ function renderReportEmailHtml(payload) {
                (o) => `<li style="margin:6px 0;">
                  <b>${escapeHtml(o.title || 'Ocorrência')}</b>
                  ${o.details ? `<div style="color:#555;">${escapeHtml(o.details)}</div>` : ''}
-               </li>`
+               </li>`,
              )
              .join('')}
          </ol>
@@ -264,23 +262,35 @@ app.post('/api/reports/notify', async (req, res) => {
     const statusUploadPdf = body?.export?.statusUploadPdf || body?.statusUploadPdf || '';
     const pdfUrl = body?.export?.pdfUrl || body?.pdfUrl || '';
 
-    // ✅ NÃO envia e-mail se ainda não tem PDF (READY + URL)
-    if (!pdfUrl || String(statusUploadPdf).toUpperCase() !== 'READY') {
-      console.log('[REPORT_NOTIFY] skip: status=', statusUploadPdf, 'pdfUrl=', pdfUrl);
-      return res.status(200).json({ ok: true, skipped: true, reason: 'PDF not ready' });
-    }
-
+    // ✅ calcula recipients SEMPRE (para log e debug)
     const recipients = asArray(body.to || REPORTS_TO_EMAIL);
+
+    console.log('[REPORT_NOTIFY] parsed recipients:', recipients);
+    console.log('[REPORT_NOTIFY] statusUploadPdf:', statusUploadPdf);
+    console.log('[REPORT_NOTIFY] pdfUrl:', pdfUrl);
+
     if (!recipients.length) {
       return res.status(400).json({
         ok: false,
         error: 'Informe "to" no body ou defina REPORTS_TO_EMAIL no ambiente.',
+        recipients,
+      });
+    }
+
+    // ✅ NÃO envia e-mail se ainda não tem PDF (READY + URL)
+    if (!pdfUrl || String(statusUploadPdf).toUpperCase() !== 'READY') {
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: 'PDF not ready',
+        statusUploadPdf,
+        pdfUrl,
+        recipients,
       });
     }
 
     console.log('[REPORT_NOTIFY] eventType:', body?.eventType);
     console.log('[REPORT_NOTIFY] exportedBy:', body?.export?.exportedBy?.operatorName);
-    console.log('[REPORT_NOTIFY] pdfUrl:', pdfUrl);
 
     const unit = body?.route?.unit || 'Unidade';
     const shift = body?.route?.shift || 'Turno';
