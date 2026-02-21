@@ -41,8 +41,15 @@ const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 // ===== Helpers =====
 function asArray(value) {
   if (!value) return [];
-  if (Array.isArray(value)) return value.filter(Boolean);
-  return [value].filter(Boolean);
+
+  if (Array.isArray(value)) {
+    return value.map(v => String(v).trim()).filter(Boolean);
+  }
+
+  return String(value)
+    .split(/[;,]/g) // aceita vírgula ou ponto-e-vírgula
+    .map(s => s.trim())
+    .filter(Boolean);
 }
 
 function escapeHtml(s) {
