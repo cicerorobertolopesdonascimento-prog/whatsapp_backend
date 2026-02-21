@@ -28,30 +28,27 @@ const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#111111';
 const BRAND_SECONDARY = process.env.BRAND_SECONDARY || '#F2C200';
 const BRAND_LOGO_URL = process.env.BRAND_LOGO_URL || '';
 
-const REPORTS_TO_EMAIL = process.env.REPORTS_TO_EMAIL || ''; // opcional
+const REPORTS_TO_EMAIL = process.env.REPORTS_TO_EMAIL || '';
 
-// Reusa o client
-const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
+// ===== Report Notify Queue =====
+const REPORT_NOTIFY_RETRY_SECONDS = Number(process.env.REPORT_NOTIFY_RETRY_SECONDS || 30);
+const REPORT_NOTIFY_MAX_ATTEMPTS = Number(process.env.REPORT_NOTIFY_MAX_ATTEMPTS || 40);
+const REPORT_NOTIFY_DEDUP_TTL_MIN = Number(process.env.REPORT_NOTIFY_DEDUP_TTL_MIN || 180);
 
-// ===== Report Notify Queue (definitivo) =====
-const REPORT_NOTIFY_RETRY_SECONDS = Number(process.env.REPORT_NOTIFY_RETRY_SECONDS || 30); // 30s
-const REPORT_NOTIFY_MAX_ATTEMPTS = Number(process.env.REPORT_NOTIFY_MAX_ATTEMPTS || 40);  // ~20min
-const REPORT_NOTIFY_DEDUP_TTL_MIN = Number(process.env.REPORT_NOTIFY_DEDUP_TTL_MIN || 180); // 3h
-
-// Memória simples (ok no Render com 1 instância; se escalar, use Redis/DB)
 const reportQueue = new Map(); // key -> { body, recipients, attempts, nextAt, createdAt }
 const reportSent = new Map();  // key -> sentAt
+
+const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
 // ===== Helpers =====
 function asArray(value) {
   if (!value) return [];
-
   const list = Array.isArray(value) ? value : String(value).split(/[;,]/g);
 
   return list
     .map((v) => String(v).trim())
     .filter((v) => v.length > 0)
-    .filter((v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)); // valida email básico
+    .filter((v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v));
 }
 
 function escapeHtml(s) {
@@ -63,15 +60,15 @@ function escapeHtml(s) {
     .replaceAll("'", '&#039;');
 }
 
+function normalizeNfc(v) {
+  if (v === undefined || v === null) return v;
+  return String(v).normalize('NFC');
+}
+
 function buildFromHeader() {
   const from = String(RESEND_FROM || '').trim();
   if (from.includes('<') && from.includes('>')) return from;
   return `${RESEND_FROM_NAME} <${from || 'onboarding@resend.dev'}>`;
-}
-
-function normalizeNfc(v) {
-  if (v === undefined || v === null) return v;
-  return String(v).normalize('NFC');
 }
 
 function ensureResendReady(res) {
@@ -83,8 +80,8 @@ function ensureResendReady(res) {
 }
 
 /**
- * ✅ KEY ESTÁVEL (NUNCA usar pdfUrl aqui)
- * Se o app mandar um id fixo (reportId/runId), usa ele. Senão, combina campos estáveis.
+ * ✅ KEY ESTÁVEL — NÃO usa pdfUrl
+ * Usa um id fixo se existir; senão compõe por campos estáveis.
  */
 function stableKeyFromReport(body, recipients) {
   const explicit =
@@ -97,26 +94,41 @@ function stableKeyFromReport(body, recipients) {
 
   if (explicit) return `rid:${String(explicit)}`;
 
+  const company = body?.companyName || body?.company || body?.route?.company || body?.route?.unitCompany || '';
   const routeName = body?.route?.routeName || body?.routeName || '';
   const unit = body?.route?.unit || '';
   const shift = body?.route?.shift || '';
   const generatedAt = body?.generatedAt || body?.export?.generatedAt || '';
   const toKey = recipients.join(',');
 
-  return `auto:${routeName}|${unit}|${shift}|${generatedAt}|${toKey}`;
+  // Coloca empresa/rota/unidade/turno/data para diferenciar relatórios
+  return `auto:${company}|${routeName}|${unit}|${shift}|${generatedAt}|${toKey}`;
 }
 
+/**
+ * ✅ Detecta READY olhando tanto no topo quanto dentro de export
+ */
 function isPdfReady(body) {
-  const statusUploadPdf = body?.export?.statusUploadPdf || body?.statusUploadPdf || '';
-  const pdfUrl = body?.export?.pdfUrl || body?.pdfUrl || '';
+  const statusUploadPdf =
+    body?.export?.statusUploadPdf ??
+    body?.statusUploadPdf ??
+    '';
+
+  const pdfUrl =
+    body?.export?.pdfUrl ??
+    body?.pdfUrl ??
+    '';
+
   const okStatus = String(statusUploadPdf).toUpperCase() === 'READY';
   const okUrl = typeof pdfUrl === 'string' && pdfUrl.trim().length > 0;
+
   return { ready: okStatus && okUrl, statusUploadPdf, pdfUrl };
 }
 
 function cleanupDedup() {
   const now = Date.now();
   const ttl = REPORT_NOTIFY_DEDUP_TTL_MIN * 60 * 1000;
+
   for (const [k, t] of reportSent.entries()) {
     if (now - t > ttl) reportSent.delete(k);
   }
@@ -253,11 +265,11 @@ app.get('/health', (req, res) => {
 
 /**
  * ✅ Endpoint definitivo:
- * - se vier READY+pdfUrl -> envia na hora
- * - se vier PENDING -> enfileira
- * - se vier READY depois -> atualiza job existente e envia via worker (ou envia na hora)
+ * - READY+url: envia na hora
+ * - PENDING: enfileira e tenta até READY
+ * - READY depois: atualiza job existente e tenta logo
  * - dedup: evita duplicados
- * - ignora payloads "vazios" (sem status e sem url)
+ * - ignora payload sem status/url
  */
 app.post('/api/reports/notify', async (req, res) => {
   try {
@@ -273,9 +285,10 @@ app.post('/api/reports/notify', async (req, res) => {
       });
     }
 
-    // ✅ evita enfileirar chamadas que não trazem status/url nenhum
-    const hasAnyPdfInfo =
-      (body?.export?.statusUploadPdf || body?.statusUploadPdf || body?.export?.pdfUrl || body?.pdfUrl);
+    // ✅ Não enfileira lixo: precisa ter pelo menos status OU url não vazio
+    const statusUploadPdfRaw = body?.export?.statusUploadPdf || body?.statusUploadPdf || '';
+    const pdfUrlRaw = body?.export?.pdfUrl || body?.pdfUrl || '';
+    const hasAnyPdfInfo = String(statusUploadPdfRaw).trim().length > 0 || String(pdfUrlRaw).trim().length > 0;
 
     if (!hasAnyPdfInfo) {
       return res.status(202).json({
@@ -286,8 +299,8 @@ app.post('/api/reports/notify', async (req, res) => {
       });
     }
 
-    const key = stableKeyFromReport(body, recipients);
     cleanupDedup();
+    const key = stableKeyFromReport(body, recipients);
 
     // dedup: já enviado
     if (reportSent.has(key)) {
@@ -300,20 +313,29 @@ app.post('/api/reports/notify', async (req, res) => {
     console.log('[REPORT_NOTIFY] recipients=', recipients);
     console.log('[REPORT_NOTIFY] statusUploadPdf=', statusUploadPdf, 'pdfUrl=', pdfUrl);
 
-    // ✅ Se já existe job, atualiza com o body mais novo (isso é o que faltava!)
+    // ✅ Se já existe job, atualiza com o body mais novo (merge profundo + espelho topo)
     const existing = reportQueue.get(key);
     if (existing) {
+      const mergedExport = { ...(existing.body.export || {}), ...(body.export || {}) };
+
       existing.body = {
         ...existing.body,
         ...body,
-        export: { ...(existing.body.export || {}), ...(body.export || {}) },
+        export: mergedExport,
+
+        // espelha no topo também (pra isPdfReady sempre pegar)
+        statusUploadPdf: body.statusUploadPdf ?? existing.body.statusUploadPdf ?? mergedExport.statusUploadPdf,
+        pdfUrl: body.pdfUrl ?? existing.body.pdfUrl ?? mergedExport.pdfUrl,
       };
+
       existing.recipients = recipients;
       existing.nextAt = Date.now() + 1000;
+
       console.log('[REPORT_NOTIFY] updated queued job key=', key);
+      console.log('[REPORT_NOTIFY] merged export status/pdf =', existing.body.export?.statusUploadPdf, existing.body.export?.pdfUrl);
     }
 
-    // Se estiver pronto, envia imediatamente
+    // ✅ Se está pronto, envia imediatamente (não depende do worker)
     if (ready) {
       const unit = body?.route?.unit || 'Unidade';
       const shift = body?.route?.shift || 'Turno';
@@ -334,7 +356,7 @@ app.post('/api/reports/notify', async (req, res) => {
       });
 
       reportSent.set(key, Date.now());
-      if (reportQueue.has(key)) reportQueue.delete(key);
+      reportQueue.delete(key);
 
       return res.status(200).json({
         ok: true,
@@ -344,7 +366,7 @@ app.post('/api/reports/notify', async (req, res) => {
       });
     }
 
-    // Se não está pronto, enfileira (ou mantém job existente)
+    // ✅ Se não está pronto: cria job se ainda não existe
     if (!existing) {
       reportQueue.set(key, {
         body,
@@ -383,7 +405,14 @@ async function processQueueTick() {
       if (job.nextAt > now) continue;
 
       const { ready, statusUploadPdf, pdfUrl } = isPdfReady(job.body);
+
       console.log('[QUEUE] key=', key, 'attempt=', job.attempts, 'ready=', ready, 'status=', statusUploadPdf);
+      console.log('[QUEUE] debug status/pdf:', {
+        topStatus: job.body.statusUploadPdf,
+        topPdf: job.body.pdfUrl,
+        exportStatus: job.body.export?.statusUploadPdf,
+        exportPdf: job.body.export?.pdfUrl,
+      });
 
       if (!ready) {
         job.attempts += 1;
@@ -437,7 +466,7 @@ async function processQueueTick() {
 
 setInterval(processQueueTick, 5000);
 
-// ✅ manter processo vivo no Render
+// ✅ manter o processo vivo no Render
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ API listening on ${PORT}`);
   console.log(`✅ NODE_ENV=${process.env.NODE_ENV || '(not set)'}`);
