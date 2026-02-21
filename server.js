@@ -232,7 +232,7 @@ app.post('/api/reports/notify', async (req, res) => {
       return res.status(500).json({ ok: false, error: 'RESEND_API_KEY não configurada.' });
     }
 
-    const body = req.body || {};
+    const body = req.body.summary || req.body || {};
     const recipients = asArray(body.to || process.env.REPORTS_TO_EMAIL);
 
     if (!recipients.length) {
