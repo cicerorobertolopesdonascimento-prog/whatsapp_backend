@@ -42,14 +42,14 @@ const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 function asArray(value) {
   if (!value) return [];
 
-  if (Array.isArray(value)) {
-    return value.map(v => String(v).trim()).filter(Boolean);
-  }
+  const list = Array.isArray(value)
+    ? value
+    : String(value).split(/[;,]/g);
 
-  return String(value)
-    .split(/[;,]/g) // aceita vírgula ou ponto-e-vírgula
-    .map(s => s.trim())
-    .filter(Boolean);
+  return list
+    .map(v => String(v).trim())
+    .filter(v => v.length > 0)
+    .filter(v => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)); // valida email básico
 }
 
 function escapeHtml(s) {
